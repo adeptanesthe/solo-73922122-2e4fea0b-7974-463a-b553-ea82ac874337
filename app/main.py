@@ -20,7 +20,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
+from .calibration import CalibrationInputError, calibrate_pair
+from .example import (
+    EXAMPLE_DESCRIPTION,
+    EXPOSURE_EXAMPLE_DESCRIPTION,
+    build_example_detections,
+    build_example_frames,
+    build_exposure_example_detections,
+    build_exposure_example_frames,
+)
 from .solver import InputConflict, solve_tracking
 
 MAX_FRAMES = 10
@@ -134,6 +142,7 @@ def _new_session(frames, detections) -> dict:
         "detections": detections,
         "judgments": [],
         "params": dict(DEFAULT_PARAMS),
+        "calibration": None,  # 最近一次色差校正 {"token", "png", "pair"}，仅保留最新
     }
     SESSIONS[sid] = sess
     return sess
@@ -187,6 +196,15 @@ async def load_example():
     return out
 
 
+@app.post("/api/example-exposure")
+async def load_exposure_example():
+    """创建内置曝光/白平衡抖动示例会话（用于色差校正演示）。"""
+    sess = _new_session(build_exposure_example_frames(), build_exposure_example_detections())
+    out = _payload(sess)
+    out["description"] = EXPOSURE_EXAMPLE_DESCRIPTION
+    return out
+
+
 @app.get("/api/sessions/{sid}")
 async def get_session(sid: str):
     return _payload(_get_session(sid))
@@ -205,6 +223,61 @@ async def get_frame(sid: str, idx: int):
 async def download_detections(sid: str):
     sess = _get_session(sid)
     return JSONResponse({"detections": sess["detections"]})
+
+
+# ---------------------------------------------------------------- 相邻帧色差校正
+
+class CalibrateBody(BaseModel):
+    frame: int  # 参考帧号；校正对象为 frame 与 frame+1 这对相邻帧
+
+
+@app.post("/api/sessions/{sid}/calibrate")
+async def calibrate_frames(sid: str, body: CalibrateBody):
+    """估计相邻帧（frame, frame+1）的逐通道单调亮度映射并校正后一帧。
+
+    只读操作：不修改原图、检测框、判断、参数与版本号。
+    校正图仅保留最近一次结果，凭一次性 token 访问 —— 新的校正请求
+    （无论成败）都会作废旧 token，迟到的旧结果无法回填。
+    """
+    sess = _get_session(sid)
+    n = len(sess["frames"])
+    i = body.frame
+    if not (0 <= i < n - 1):
+        _err(400, f"帧号 {i} 无法组成相邻帧对（需 0 ≤ frame ≤ {max(n - 2, 0)}）。")
+    boxes = [
+        [d["rect"] for d in sess["detections"] if d["frame"] == f] for f in (i, i + 1)
+    ]
+    img_a = sess["frames"][i][1]
+    img_b = sess["frames"][i + 1][1]
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            EXECUTOR, calibrate_pair, img_a, img_b, boxes[0], boxes[1]
+        )
+    except CalibrationInputError as exc:
+        _err(400, str(exc))
+    result["frame"] = i
+    result["pair"] = [i, i + 1]
+    corrected = result.pop("corrected_png")
+    if result["ok"]:
+        token = uuid.uuid4().hex[:12]
+        sess["calibration"] = {"token": token, "png": corrected, "pair": [i, i + 1]}
+        result["corrected_url"] = (
+            f"/api/sessions/{sid}/calibration/{token}/corrected.png"
+        )
+    else:
+        sess["calibration"] = None  # 无法可靠对齐：撤下可能存在的旧校正图
+    return result
+
+
+@app.get("/api/sessions/{sid}/calibration/{token}/corrected.png")
+async def get_corrected_frame(sid: str, token: str):
+    """按 token 取最近一次校正图；token 过期（被更新请求取代）即 404。"""
+    sess = _get_session(sid)
+    cal = sess.get("calibration")
+    if cal is None or cal["token"] != token:
+        _err(404, "校正图不存在或已被更新的校正请求取代。")
+    return Response(content=cal["png"], media_type="image/png")
 
 
 # ---------------------------------------------------------------- 判断与参数

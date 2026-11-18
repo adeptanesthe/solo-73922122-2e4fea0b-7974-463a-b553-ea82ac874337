@@ -200,3 +200,33 @@ button.secondary { background: transparent; }
 
 #session-info { font-size: 12px; margin-top: 8px; line-height: 1.6; }
 #solve-status { margin-top: 8px; line-height: 1.6; }
+
+/* 相邻帧色差校正 */
+#calib-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+#calib-preview {
+  display: none;
+  gap: 12px;
+  margin-top: 8px;
+}
+.calib-pane { flex: 1; min-width: 0; }
+.calib-pane canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.calib-label {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+#calib-diag { margin-top: 6px; line-height: 1.7; }

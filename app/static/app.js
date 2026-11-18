@@ -20,11 +20,11 @@ const state = {
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  calib: { token: 0 },    // 色差校正请求序号；切帧/切会话/新请求即 +1，迟到结果据此丢弃
 };
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("canvas");
-const ctx = canvas.getContext("2d");
 
 const detById = (id) => state.detections.find((d) => d.id === id);
 const pairKey = (a, b) => [a, b].sort().join("||");
@@ -73,12 +73,16 @@ function loadSession(payload) {
   state.result = null;
   state.jobId = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  invalidateCalibration(); // 切会话：撤下旧校正预览，旧请求结果不得回填
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
     const img = new Image();
     img.src = `/api/sessions/${state.sessionId}/frames/${i}`;
-    img.onload = () => { if (i === state.currentFrame) draw(); };
+    img.onload = () => {
+      if (i === state.currentFrame) draw();
+      updateCalibControls(); // 帧图就绪后才能做尺寸预检
+    };
     state.images.push(img);
   }
 
@@ -130,38 +134,53 @@ async function loadExample() {
   }
 }
 
+async function loadExposureExample() {
+  try {
+    const payload = await api("/api/example-exposure", { method: "POST" });
+    loadSession(payload);
+  } catch (err) {
+    showError("session-info", err);
+  }
+}
+
 /* ------------------------------------------------------------ 画面渲染 */
 
 function detsInFrame(f) {
   return state.detections.filter((d) => d.frame === f);
 }
 
-function draw() {
-  const img = state.images[state.currentFrame];
-  if (!img || !img.complete || img.naturalWidth === 0) return;
-  canvas.width = img.naturalWidth;
-  canvas.height = img.naturalHeight;
-  ctx.drawImage(img, 0, 0);
+/* 把一帧图像连同检测框画到指定画布上（主视图与校正预览共用） */
+function paintFrame(canvasEl, img, frameIdx) {
+  canvasEl.width = img.naturalWidth || img.width;
+  canvasEl.height = img.naturalHeight || img.height;
+  const c = canvasEl.getContext("2d");
+  c.drawImage(img, 0, 0);
 
-  for (const d of detsInFrame(state.currentFrame)) {
+  for (const d of detsInFrame(frameIdx)) {
     const [x, y, w, h] = d.rect;
     const ti = trajIndexOf(d.id);
     const color = ti !== null ? PALETTE[ti % PALETTE.length] : "#ffe600";
     const selected = state.selection.includes(d.id);
 
-    ctx.lineWidth = selected ? 4 : 2;
-    ctx.strokeStyle = selected ? "#ffffff" : color;
-    ctx.strokeRect(x, y, w, h);
+    c.lineWidth = selected ? 4 : 2;
+    c.strokeStyle = selected ? "#ffffff" : color;
+    c.strokeRect(x, y, w, h);
 
     const label = `#${d.id}` + (ti !== null ? ` T${ti + 1}` : "");
-    ctx.font = "bold 12px sans-serif";
-    const tw = ctx.measureText(label).width;
+    c.font = "bold 12px sans-serif";
+    const tw = c.measureText(label).width;
     const ly = y >= 16 ? y - 16 : y + h + 2;
-    ctx.fillStyle = "rgba(0,0,0,0.65)";
-    ctx.fillRect(x, ly, tw + 6, 15);
-    ctx.fillStyle = color;
-    ctx.fillText(label, x + 3, ly + 12);
+    c.fillStyle = "rgba(0,0,0,0.65)";
+    c.fillRect(x, ly, tw + 6, 15);
+    c.fillStyle = color;
+    c.fillText(label, x + 3, ly + 12);
   }
+}
+
+function draw() {
+  const img = state.images[state.currentFrame];
+  if (!img || !img.complete || img.naturalWidth === 0) return;
+  paintFrame(canvas, img, state.currentFrame);
 }
 
 function renderFrameNav() {
@@ -170,12 +189,14 @@ function renderFrameNav() {
     n === 0 ? "— / —" : `第 ${state.currentFrame + 1} / ${n} 帧（本帧 ${detsInFrame(state.currentFrame).length} 框）`;
   $("prev-frame").disabled = n === 0 || state.currentFrame === 0;
   $("next-frame").disabled = n === 0 || state.currentFrame >= n - 1;
+  updateCalibControls();
 }
 
 function switchFrame(delta) {
   const next = state.currentFrame + delta;
   if (next < 0 || next >= state.nFrames) return;
   state.currentFrame = next;
+  invalidateCalibration(); // 切帧：撤下旧校正预览，迟到结果不得回填
   renderFrameNav();
   draw();
 }
@@ -429,6 +450,123 @@ function renderResult() {
   });
 }
 
+/* ------------------------------------------------------------ 相邻帧色差校正 */
+
+function invalidateCalibration() {
+  state.calib.token += 1; // 使进行中的请求与未加载完的校正图全部作废
+  $("calib-preview").style.display = "none";
+  $("calib-diag").textContent = "";
+  const status = $("calib-status");
+  status.className = "banner muted";
+  status.textContent = "尚未校正。";
+  updateCalibControls();
+}
+
+function updateCalibControls() {
+  const btn = $("calib-btn");
+  const pairEl = $("calib-pair");
+  if (!state.sessionId || state.nFrames < 2) {
+    btn.disabled = true;
+    pairEl.textContent = "—";
+    return;
+  }
+  const i = state.currentFrame;
+  if (i >= state.nFrames - 1) {
+    btn.disabled = true;
+    pairEl.textContent = `第 ${i + 1} 帧已是最后一帧，无下一帧可校正。`;
+    return;
+  }
+  let note = "";
+  const imA = state.images[i];
+  const imB = state.images[i + 1];
+  const ready = imA && imB && imA.complete && imB.complete &&
+    imA.naturalWidth > 0 && imB.naturalWidth > 0;
+  if (ready) {
+    if (imA.naturalWidth !== imB.naturalWidth || imA.naturalHeight !== imB.naturalHeight) {
+      note = "（两帧尺寸不一致，无法校正）";
+    } else if (imA.naturalWidth > 512 || imA.naturalHeight > 512) {
+      note = "（帧尺寸超过 512×512，无法校正）";
+    }
+  }
+  pairEl.textContent = `当前帧对：第 ${i + 1} 帧（参考） ↔ 第 ${i + 2} 帧（待校正）${note}`;
+  btn.disabled = note !== "";
+}
+
+function renderCalibDiag(d) {
+  if (!d) return;
+  const parts = [
+    `有效样本 ${d.n_samples}`,
+    `覆盖区域 ${d.cells_covered}/${d.cells_total}`,
+    `亮度跨度 ${d.span_luma}`,
+    `通道跨度 R/G/B ${d.span_channels.join("/")}`,
+    `区域一致性最大偏差 ${d.region_max_deviation} 灰级`,
+    `动物像素越界 ${(d.animal_out_frac * 100).toFixed(1)}%（${d.animal_out_count}/${d.animal_pixels}）`,
+  ];
+  if (d.trusted_range) {
+    const [r, g, b] = d.trusted_range;
+    parts.push(`可信标定范围 R[${r[0]}, ${r[1]}] G[${g[0]}, ${g[1]}] B[${b[0]}, ${b[1]}]`);
+  }
+  $("calib-diag").textContent = parts.join("；");
+}
+
+async function runCalibration() {
+  if (!state.sessionId) return;
+  const frame = state.currentFrame;
+  const token = ++state.calib.token;
+  const status = $("calib-status");
+  status.className = "banner muted";
+  status.textContent = `正在估计第 ${frame + 1} ↔ ${frame + 2} 帧的背景亮度映射…`;
+  $("calib-preview").style.display = "none";
+  $("calib-diag").textContent = "";
+
+  let resp;
+  try {
+    resp = await api(`/api/sessions/${state.sessionId}/calibrate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ frame }),
+    });
+  } catch (err) {
+    if (token !== state.calib.token) return; // 已切帧/切会话：迟到错误不回填
+    status.className = "banner err";
+    status.textContent = `校正失败：${err.message}`;
+    return;
+  }
+  if (token !== state.calib.token) return; // 迟到结果：已切帧/切会话/有更新请求，丢弃
+  if (resp.pair && (resp.pair[0] !== state.currentFrame)) return; // 与当前帧对不符，丢弃
+
+  renderCalibDiag(resp.diagnostics);
+  if (!resp.ok) {
+    status.className = "banner err";
+    status.textContent = `无法可靠对齐，不显示校正图：${resp.reasons.join("；")}`;
+    return;
+  }
+  const corrected = new Image();
+  corrected.onload = () => {
+    if (token !== state.calib.token) return; // 校正图迟到：不回填
+    drawCalibPreview(frame, corrected);
+    status.className = "banner ok";
+    status.textContent =
+      `已对齐：左为第 ${frame + 1} 帧（参考，原图），右为校正后的第 ${frame + 2} 帧。`;
+  };
+  corrected.onerror = () => {
+    if (token !== state.calib.token) return;
+    status.className = "banner err";
+    status.textContent = "校正图加载失败（可能已被更新的校正请求取代）。";
+  };
+  corrected.src = resp.corrected_url;
+}
+
+function drawCalibPreview(frame, correctedImg) {
+  const refImg = state.images[frame];
+  if (!refImg || !refImg.complete || refImg.naturalWidth === 0) return;
+  paintFrame($("calib-ref"), refImg, frame);
+  paintFrame($("calib-corr"), correctedImg, frame + 1);
+  $("calib-ref-label").textContent = `参考帧：第 ${frame + 1} 帧（原图）`;
+  $("calib-corr-label").textContent = `校正后：第 ${frame + 2} 帧`;
+  $("calib-preview").style.display = "flex";
+}
+
 /* ------------------------------------------------------------ 汇总渲染 */
 
 function renderAll() {
@@ -447,12 +585,14 @@ function renderAll() {
 
 $("upload-btn").addEventListener("click", uploadSession);
 $("example-btn").addEventListener("click", loadExample);
+$("example-exposure-btn").addEventListener("click", loadExposureExample);
 $("prev-frame").addEventListener("click", () => switchFrame(-1));
 $("next-frame").addEventListener("click", () => switchFrame(1));
 $("mark-same").addEventListener("click", () => setJudgment("same"));
 $("mark-diff").addEventListener("click", () => setJudgment("different"));
 $("mark-clear").addEventListener("click", () => setJudgment(null));
 $("solve-btn").addEventListener("click", solve);
+$("calib-btn").addEventListener("click", runCalibration);
 canvas.addEventListener("click", onCanvasClick);
 for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
   $(id).addEventListener("change", applyParams);

@@ -25,6 +25,7 @@
       <div class="btn-row">
         <button id="upload-btn">上传并创建会话</button>
         <button id="example-btn" class="secondary">加载交叉遮挡示例</button>
+        <button id="example-exposure-btn" class="secondary">加载曝光抖动示例</button>
       </div>
       <div id="session-info" class="muted">尚未创建会话。</div>
     </section>
@@ -72,6 +73,30 @@
       <div id="judgment-panel">
         <h3>当前身份判断 <span id="judgment-count" class="muted"></span></h3>
         <ul id="judgment-list"></ul>
+      </div>
+    </section>
+
+    <section class="card" id="calib-card">
+      <h2>5. 相邻帧色差校正（曝光 / 白平衡对齐）</h2>
+      <div class="muted small">
+        以当前帧为参考，从两帧检测框外的背景估计各颜色通道的单调亮度映射，
+        校正下一帧并并排对比毛色。仅作预览：原图、检测框、轨迹与计数均不受影响。
+      </div>
+      <div id="calib-controls">
+        <span id="calib-pair" class="muted small">—</span>
+        <button id="calib-btn" class="primary" disabled>校正当前帧与下一帧</button>
+      </div>
+      <div id="calib-status" class="banner muted">尚未校正。</div>
+      <div id="calib-diag" class="muted small"></div>
+      <div id="calib-preview">
+        <div class="calib-pane">
+          <canvas id="calib-ref" width="320" height="240"></canvas>
+          <div class="calib-label" id="calib-ref-label">参考帧（原图）</div>
+        </div>
+        <div class="calib-pane">
+          <canvas id="calib-corr" width="320" height="240"></canvas>
+          <div class="calib-label" id="calib-corr-label">校正后</div>
+        </div>
       </div>
     </section>
 
